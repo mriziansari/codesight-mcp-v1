@@ -1,0 +1,14 @@
+{
+    "mcpServers": {
+        "codesight": {
+            "command": "/Volumes/Work/MCP/codesight-mcp/venv/bin/python",
+            "args": [
+                "/Volumes/Work/MCP/codesight-mcp/main.py",
+                "server"
+            ],
+            "env": {
+                "CODESIGHT_CODEBASE_PATH": "/Volumes/Work/AI Work/AI Learning/rag_learning"
+            }
+        }
+    }
+}
