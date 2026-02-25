@@ -9,17 +9,31 @@ from mcp.types import (
     LoggingLevel
 )
 import json
+import sys
 from typing import List
 from mcp.server.stdio import stdio_server
 from pathlib import Path
 from codesight.config import settings
 from codesight.index.file_discovery import FileDiscovery
 from codesight.index.git_tracker import GitTracker
+from codesight.index.vector_store import VectorStore
+from codesight.index.file_reader import FileReader
 
 # Initialize global tracker
 git_tracker = None
 
 app = Server("codesight-mcp")
+_vector_store = None
+_indexed = False
+
+def get_vector_store():
+    global _vector_store
+    if _vector_store is None:
+        from codesight.config import settings
+        index_dir = settings.codebase_path / ".codesight" / "vectors"
+        index_dir.parent.mkdir(parents=True, exist_ok=True)
+        _vector_store = VectorStore(index_dir)
+    return _vector_store
 
 @app.list_resources()
 
@@ -77,6 +91,25 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["file_path"]
             }
+        ),
+        Tool(
+            name="search_code",
+            description="Search codebase by natural language description",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for (e.g., 'authentication', 'database connection')"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of results (default 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }
         )
     ]
 
@@ -129,6 +162,62 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
             type="text", 
             text=f"Git blame for {file_path_str}:\n" + "\n".join(lines)
         )]
+    
+    elif name == "search_code":
+        query = arguments.get("query", "")
+        limit = arguments.get("limit", 5)
+        
+        if not query:
+            raise ValueError("Query is required")
+
+        store = get_vector_store()
+
+        #Auto index if not done yet
+        global _indexed
+
+        if not _indexed:
+            # Index files
+            reader = FileReader(settings.codebase_path)
+            discovery = FileDiscovery(settings.codebase_path)
+
+            files = list(discovery.discover())
+            py_files = [f for f in files if f.suffix == '.py'][:20]
+            
+            
+            for file_path in py_files:
+                try:
+                    content = reader.read(file_path)
+                    store.add_file(content)
+                except Exception as e:
+                    print(f"Error indexing file {file_path}: {e}", file=sys.stderr)
+            
+            _indexed = True
+        
+        # Ensure codebase is indexed
+        if not _indexed:
+            return [TextContent(
+                type="text", 
+                text="Codebase not indexed. Run 'initialize_codebase' first."
+            )]
+        
+        # Search using vector store
+        results = store.search(query, n_results=limit)
+        
+        if not results:
+            return [TextContent(
+                type="text", 
+                text=f"No results found for '{query}'"
+            )]
+        
+        # Format response
+        lines = [f"Found {len(results)} results for '{query}':\n"]
+        for i, r in enumerate(results, 1):
+            meta = r['metadata']
+            lines.append(f"{i}. `{meta['symbol_name']}` ({meta['symbol_type']}) in `{meta['file_path']}`")
+            lines.append(f"   Line {meta['start_line']}")
+            lines.append(f"   ```python\n   {r['content'][:200]}...\n   ```\n")
+    
+        return [TextContent(type="text", text="\n".join(lines))]
     
     raise ValueError(f"Tool {name} not found")
 
