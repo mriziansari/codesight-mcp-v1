@@ -18,6 +18,8 @@ from codesight.index.file_discovery import FileDiscovery
 from codesight.index.git_tracker import GitTracker
 from codesight.index.vector_store import VectorStore
 from codesight.index.file_reader import FileReader
+from codesight.index.dependency_graph import DependencyGraph
+from codesight.tools.refactor_planner import RefactorPlanner
 
 # Initialize global tracker
 git_tracker = None
@@ -25,6 +27,8 @@ git_tracker = None
 app = Server("codesight-mcp")
 _vector_store = None
 _indexed = False
+
+_dependency_graph = None
 
 def get_vector_store():
     global _vector_store
@@ -34,6 +38,14 @@ def get_vector_store():
         index_dir.parent.mkdir(parents=True, exist_ok=True)
         _vector_store = VectorStore(index_dir)
     return _vector_store
+
+def get_dependency_graph():
+    global _dependency_graph
+    if _dependency_graph is None:
+        from codesight.config import settings
+        _dependency_graph = DependencyGraph(settings.codebase_path)
+        _dependency_graph.build()  # Build once, reuse
+    return _dependency_graph
 
 @app.list_resources()
 
@@ -110,12 +122,64 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["query"]
             }
-        )
+        ),
+        Tool(
+             name="get_dependencies",
+            description="Show what files a given file imports (its dependencies)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                "type": "string",
+                "description": "Relative path to file (e.g., 'src/auth.py')"
+            }
+        },
+        "required": ["file_path"]
+            }
+        ),
+        Tool(
+            name="analyze_impact",
+            description="Analyze what files might break if you change a specific file",
+            inputSchema={
+                "type": "object",
+                "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Relative path to file to analyze"
+            }
+        },
+        "required": ["file_path"]
+            }
+        ),
+        Tool(
+            name="plan_refactor",
+            description="Generate a refactoring plan for renaming a function or class across the codebase",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "old_name": {
+                        "type": "string",
+                        "description": "Current name of function/class to rename"
+                     },
+                    "new_name": {
+                        "type": "string",
+                        "description": "Desired new name"
+                    },
+                    "file_hint": {
+                        "type": "string",
+                        "description": "Optional: file where symbol is defined (e.g., 'src/auth.py')",
+                        "default": None
+                    }
+                },
+                "required": ["old_name", "new_name"]
+            }
+        )    
     ]
 
 @app.call_tool()
 
 async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent | EmbeddedResource]:
+    global _indexed
     """
     Call a specific tool
     """
@@ -173,7 +237,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
         store = get_vector_store()
 
         #Auto index if not done yet
-        global _indexed
 
         if not _indexed:
             # Index files
@@ -216,6 +279,93 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
             lines.append(f"{i}. `{meta['symbol_name']}` ({meta['symbol_type']}) in `{meta['file_path']}`")
             lines.append(f"   Line {meta['start_line']}")
             lines.append(f"   ```python\n   {r['content'][:200]}...\n   ```\n")
+    
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "get_dependencies":
+        file_path = arguments.get("file_path", "")
+        if not file_path:
+            raise ValueError("file_path is required")
+    
+        graph = get_dependency_graph()
+        deps = graph.get_dependencies(file_path)
+        
+        if not deps:
+            return [TextContent(type="text", text=f"`{file_path}` has no dependencies or doesn't exist.")]
+    
+        lines = [f"`{file_path}` imports {len(deps)} files:\n"]
+        for dep in deps:
+            lines.append(f"  - `{dep}`")
+    
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "analyze_impact":
+        file_path = arguments.get("file_path", "")
+        if not file_path:
+            raise ValueError("file_path is required")
+    
+        graph = get_dependency_graph()
+        impact = graph.get_impact(file_path)
+    
+        if 'error' in impact:
+            return [TextContent(type="text", text=f"Error: {impact['error']}")]
+    
+        lines = [
+        f"Impact Analysis: `{file_path}`\n",
+        f"**Risk Score:** {impact['risk_score']:.1%}\n",
+        f"**Direct dependents:** {len(impact['direct_dependents'])} files",
+        f"**Total affected:** {impact['total_affected']} files (including transitive)\n"
+        ]
+    
+        if impact['direct_dependents']:
+            lines.append("**Direct dependents:**")
+            for dep in impact['direct_dependents'][:10]:  # Show first 10
+                lines.append(f"  - `{dep}`")
+        
+            if len(impact['direct_dependents']) > 10:
+                    lines.append(f"  ... and {len(impact['direct_dependents']) - 10} more")
+    
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "plan_refactor":
+        old_name = arguments.get("old_name", "")
+        new_name = arguments.get("new_name", "")
+        file_hint = arguments.get("file_hint")
+    
+        if not old_name or not new_name:
+            raise ValueError("old_name and new_name are required")
+    
+        # Ensure vector store and graph are ready
+        store = get_vector_store()
+        graph = get_dependency_graph()
+    
+        # Auto-index if needed (simplified)
+        if not _indexed:
+            # ... index files ...
+            _indexed = True
+    
+        planner = RefactorPlanner(settings.codebase_path, store, graph)
+        plan = planner.plan_rename(old_name, new_name, file_hint)
+    
+        if 'error' in plan:
+            return [TextContent(type="text", text=f"Error: {plan['error']}")]
+    
+        lines = [
+            f"Refactor Plan: `{old_name}` → `{new_name}`\n",
+            f"**Risk Level:** {plan['risk_level'].upper()}",
+            f"**Files Affected:** {plan['files_affected']}",
+            f"**Total Changes:** {plan['total_changes']}\n",
+            f"**Suggested Order:** {plan['suggested_order']}\n",
+            "**Detailed Steps:**"
+        ]
+    
+        for i, step in enumerate(plan['steps'][:15], 1):  # Show first 15
+            lines.append(f"{i}. `{step['file']}` (line {step['line']})")
+            lines.append(f"   Change: {step['change'][:80]}...")
+            lines.append(f"   Reason: {step['reason']}\n")
+    
+        if len(plan['steps']) > 15:
+            lines.append(f"... and {len(plan['steps']) - 15} more changes")
     
         return [TextContent(type="text", text="\n".join(lines))]
     

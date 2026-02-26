@@ -16,7 +16,13 @@ class FileDiscovery:
             str_path = str(relative_path)
 
             # Check ignore patterns
-            if any(fnmatch.fnmatch(str_path, pattern) for pattern in settings.ignore_patterns):
+            parts = relative_path.parts
+            should_ignore = False
+            for part in parts:
+                if any(fnmatch.fnmatch(part, pattern) for pattern in settings.ignore_patterns):
+                    should_ignore = True
+                    break
+            if should_ignore:
                 continue
 
             #  Check watch patterns
