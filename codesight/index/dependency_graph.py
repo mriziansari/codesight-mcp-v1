@@ -32,7 +32,7 @@ class DependencyGraph:
     """
     
     def __init__(self, root_path: Path):
-        self.root = root_path
+        self.root = root_path.resolve()
         self.graph = nx.DiGraph()  # Directed graph: A → B means A depends on B
         parser = Parser()
         parser.language = Language(tspython.language())
